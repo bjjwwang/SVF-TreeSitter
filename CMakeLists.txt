@@ -66,3 +66,6 @@ target_compile_options(svf-ts-core PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 add_executable(ts-svf src/main.cpp)
 target_link_libraries(ts-svf PRIVATE svf-ts-core)
+
+enable_testing()
+add_subdirectory(tests)

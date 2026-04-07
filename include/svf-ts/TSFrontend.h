@@ -1,7 +1,10 @@
 // TSFrontend.h — main entry: source files → SVFIR
 #pragma once
 #include "SVFIR/SVFIR.h"
+#include "svf-ts/TSTypeBuilder.h"
+#include "svf-ts/TSSymbolTable.h"
 #include <tree_sitter/api.h>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,6 +26,10 @@ private:
     };
     TSParser* parser;
     std::vector<SourceFile> files;
+    // These must out-live the SVFIR — SVFVar nodes hold non-owning pointers
+    // into TSTypeBuilder's owned types. Don't leave them on a stack frame.
+    std::unique_ptr<TSTypeBuilder> tb;
+    std::unique_ptr<TSSymbolTable> sym;
 };
 
 } // namespace svfts

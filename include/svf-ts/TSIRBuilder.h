@@ -68,6 +68,8 @@ private:
     /// Create a value/obj pair for a local variable, attach AddrStmt.
     Symbol createLocal(const std::string& name, const SVF::SVFType* ty);
     Symbol createGlobal(const std::string& name, const SVF::SVFType* ty);
+    /// set name on a node id (idempotent, ignored if not present)
+    void nameNode(SVF::NodeID id, const std::string& name);
 
     /// Get text of a tree-sitter node.
     std::string text(TSNode n, const std::string& src) const {

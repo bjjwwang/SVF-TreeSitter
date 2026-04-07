@@ -14,6 +14,7 @@
 #include "Graphs/ICFGNode.h"
 #include "Graphs/BasicBlockG.h"
 #include "Util/SVFLoopAndDomInfo.h"
+#include "Graphs/CallGraph.h"
 #include <cassert>
 #include <cstring>
 #include <functional>
@@ -39,7 +40,8 @@ void TSIRBuilder::initSpecials() {
 
 NodeID TSIRBuilder::freshValVar(const SVFType* ty) {
     NodeID id = NodeIDAllocator::get()->allocateValueId();
-    B.addValNode(id, ty ? ty : SVFType::getSVFPtrType(), currentICFG);
+    const SVFType* eff = ty ? ty : tb->getPtrType();
+    B.addValNode(id, eff, currentICFG);
     return id;
 }
 
@@ -56,11 +58,18 @@ NodeID TSIRBuilder::freshObjVar(const SVFType* ty, unsigned flag) {
     return id;
 }
 
+void TSIRBuilder::nameNode(NodeID id, const std::string& name) {
+    if (!pag->hasGNode(id)) return;
+    if (auto* v = pag->getGNode(id)) v->setName(name);
+}
+
 Symbol TSIRBuilder::createLocal(const std::string& name, const SVFType* ty) {
     Symbol s;
     s.type = ty;
     s.objId = freshObjVar(ty, ObjTypeInfo::STACK_OBJ);
     s.valId = freshValVar(SVFType::getSVFPtrType());
+    nameNode(s.objId, name + ".addr");
+    nameNode(s.valId, name);
     B.addAddrStmt(s.objId, s.valId);
     st->addLocal(name, s);
     return s;
@@ -71,6 +80,8 @@ Symbol TSIRBuilder::createGlobal(const std::string& name, const SVFType* ty) {
     s.type = ty;
     s.objId = freshObjVar(ty, ObjTypeInfo::GLOBVAR_OBJ);
     s.valId = freshValVar(SVFType::getSVFPtrType());
+    nameNode(s.objId, name + ".addr");
+    nameNode(s.valId, name);
     B.addAddrStmt(s.objId, s.valId);
     st->addGlobal(name, s);
     return s;
@@ -218,6 +229,9 @@ void TSIRBuilder::visitFunctionDef(TSNode n, const std::string& src) {
 
     // create one dummy SVFBasicBlock attached to the function so ICFG nodes
     // have something non-null to point at.
+    // Register the function in the CallGraph so Andersen can resolve it.
+    const_cast<CallGraph*>(pag->getCallGraph())->addCallGraphNode(funObj);
+
     SVFBasicBlock* dummyBB = makeBB("entry");
     currentBB = dummyBB;
     auto* entry = icfgB->addFunEntry(funObj);
@@ -298,7 +312,15 @@ void TSIRBuilder::visitGlobalDecl(TSNode n, const std::string& src) {
             SVFType* eff = ty;
             if (strcmp(k, "pointer_declarator") == 0 || text(c, src).find('*') != std::string::npos)
                 eff = tb->getPtrType();
-            createGlobal(name, eff);
+            Symbol s = createGlobal(name, eff);
+            // Process initializer if present (init_declarator only)
+            if (strcmp(k, "init_declarator") == 0) {
+                TSNode valN = ts_node_child_by_field_name(c, "value", 5);
+                if (!ts_node_is_null(valN)) {
+                    NodeID rhs = visitExpr(valN, src);
+                    B.addStoreStmt(rhs, s.valId, currentICFG);
+                }
+            }
         }
     }
 }
@@ -353,7 +375,7 @@ void TSIRBuilder::visitLocalDecl(TSNode n, const std::string& src) {
             Symbol s = createLocal(name, eff);
             if (!ts_node_is_null(valN)) {
                 NodeID rhs = visitExpr(valN, src);
-                B.addStoreStmt(s.valId, rhs, currentICFG);
+                B.addStoreStmt(rhs, s.valId, currentICFG);
             }
         } else if (strcmp(k, "identifier") == 0 ||
                    strcmp(k, "pointer_declarator") == 0 ||
@@ -505,7 +527,7 @@ NodeID TSIRBuilder::visitAssign(TSNode n, const std::string& src) {
     const char* k = ts_node_type(l);
     if (strcmp(k, "identifier") == 0) {
         const Symbol* sym = st->lookup(text(l, src));
-        if (sym) B.addStoreStmt(sym->valId, rhs, currentICFG);
+        if (sym) B.addStoreStmt(rhs, sym->valId, currentICFG);
         return rhs;
     }
     if (strcmp(k, "pointer_expression") == 0 || strcmp(k, "unary_expression") == 0) {
@@ -514,7 +536,7 @@ NodeID TSIRBuilder::visitAssign(TSNode n, const std::string& src) {
         if (ts_node_is_null(arg) && ts_node_named_child_count(l) > 0)
             arg = ts_node_named_child(l, 0);
         NodeID p = visitExpr(arg, src);
-        B.addStoreStmt(p, rhs, currentICFG);
+        B.addStoreStmt(rhs, p, currentICFG);
         return rhs;
     }
     if (strcmp(k, "field_expression") == 0) {
@@ -535,14 +557,14 @@ NodeID TSIRBuilder::visitAssign(TSNode n, const std::string& src) {
         // we don't track types precisely → variant gep
         NodeID gepDst = gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
         (void)sty; (void)fname;
-        B.addStoreStmt(gepDst, rhs, currentICFG);
+        B.addStoreStmt(rhs, gepDst, currentICFG);
         return rhs;
     }
     if (strcmp(k, "subscript_expression") == 0) {
         TSNode arr = ts_node_child_by_field_name(l, "argument", 8);
         NodeID base = visitExpr(arr, src);
         NodeID g = gep->addVariantGep(base, SVFType::getSVFPtrType(), currentICFG);
-        B.addStoreStmt(g, rhs, currentICFG);
+        B.addStoreStmt(rhs, g, currentICFG);
         return rhs;
     }
     return rhs;
