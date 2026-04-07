@@ -15,6 +15,25 @@ foreach(t ${ALL_TESTS})
 endforeach()
 
 # =============================================================================
+# Layer 2 — inline `// EXPECTED:` ground truth (exact match)
+# =============================================================================
+find_program(PYTHON3 python3)
+if(PYTHON3)
+    foreach(t ${ALL_TESTS})
+        get_filename_component(name ${t} NAME_WE)
+        get_filename_component(dir  ${t} DIRECTORY)
+        add_test(NAME L2.${dir}.${name}
+                 COMMAND ${PYTHON3}
+                         ${CMAKE_SOURCE_DIR}/scripts/check_expected.py
+                         ${CMAKE_CURRENT_SOURCE_DIR}/${t})
+        set_tests_properties(L2.${dir}.${name} PROPERTIES
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT
+            "TS_SVF=$<TARGET_FILE:ts-svf>;LD_LIBRARY_PATH=${SVF_DIR}/Release-build/lib:${SVF_DIR}/z3.obj/bin")
+    endforeach()
+endif()
+
+# =============================================================================
 # Layer 3 — points-to soundness vs. SVF's LLVM frontend
 # =============================================================================
 # Each L3 test runs clang+wpa on the same .c source, normalizes both pts
