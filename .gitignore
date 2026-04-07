@@ -1,0 +1,6 @@
+build/
+*.o
+*.a
+*.so
+third_party/tree-sitter/
+third_party/tree-sitter-c/
