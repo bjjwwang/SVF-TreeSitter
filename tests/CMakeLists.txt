@@ -53,11 +53,6 @@ if(BASH_EXE AND PYTHON3 AND EXISTS ${SVF_DIR}/llvm-18.1.0.obj/bin/clang
             ENVIRONMENT
             "SVF_DIR=${SVF_DIR};TS_SVF=$<TARGET_FILE:ts-svf>")
     endforeach()
-    # Tests with known frontend gaps — XFAIL until those features land.
-    # 61_call needs CallPE/RetPE wiring (interprocedural pts flow).
-    if(TEST L3.inter.61_call)
-        set_tests_properties(L3.inter.61_call PROPERTIES WILL_FAIL TRUE)
-    endif()
 else()
     message(STATUS "L3 comparison tests disabled (need clang/wpa/python3/bash)")
 endif()

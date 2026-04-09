@@ -76,8 +76,23 @@ public:
     IntraICFGNode* addIntra(const SVFBasicBlock* bb) {
         return icfg->addIntraICFGNode(bb, false);
     }
+    CallICFGNode* addCall(const SVFBasicBlock* bb, const SVFType* ty,
+                          const FunObjVar* callee, bool vararg = false) {
+        return icfg->addCallICFGNode(bb, ty, callee, vararg,
+                                     /*isvcall*/false, /*vcallIdx*/0,
+                                     /*funNameOfVcall*/"");
+    }
+    RetICFGNode* addRet(CallICFGNode* c) {
+        return icfg->addRetICFGNode(c);
+    }
     void addIntraEdge(ICFGNode* a, ICFGNode* b) {
         if (a && b) icfg->addIntraEdge(a, b);
+    }
+    void addCallEdge(ICFGNode* a, ICFGNode* b) {
+        if (a && b) icfg->addCallEdge(a, b);
+    }
+    void addRetEdge(ICFGNode* a, ICFGNode* b) {
+        if (a && b) icfg->addRetEdge(a, b);
     }
     void addGlobal(GlobalICFGNode* g) { icfg->addGlobalICFGNode(g); }
     GlobalICFGNode* global() { return icfg->getGlobalICFGNode(); }

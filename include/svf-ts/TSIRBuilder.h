@@ -32,6 +32,12 @@ private:
     void visitFunctionDef(TSNode n, const std::string& src);
     void visitGlobalDecl(TSNode n, const std::string& src);
 
+    /// Pre-pass: register every top-level function (signature, FunObjVar,
+    /// entry/exit ICFG nodes, formal ValVars, ret ValVar) BEFORE visiting
+    /// any function body. This lets visitCall resolve forward references
+    /// and emit CallPE/RetPE without a second pass.
+    void prescanFunctionDef(TSNode n, const std::string& src);
+
     // -------- statements --------
     void visitStmt(TSNode n, const std::string& src);
     void visitCompound(TSNode n, const std::string& src);
@@ -77,8 +83,6 @@ private:
                           ts_node_end_byte(n) - ts_node_start_byte(n));
     }
 
-    /// Find the field-index of `fieldName` in struct `st`. -1 if not found.
-    int findFieldIdx(const SVF::SVFStructType* st, const std::string& fieldName) const;
 
 private:
     SVF::SVFIR* pag;
@@ -91,9 +95,62 @@ private:
     const SVF::FunObjVar* currentFunc = nullptr;
     SVF::ICFGNode* currentICFG = nullptr;
     SVF::SVFBasicBlock* currentBB = nullptr;
+    SVF::NodeID currentRetVal = 0;
+    bool currentRetIsPtr = false;
 
-    // Track field names per struct (since SVFStructType doesn't carry them).
-    std::unordered_map<const SVF::SVFStructType*, std::vector<std::string>> structFieldNames;
+    // Per-function metadata, populated by prescanFunctionDef and consumed
+    // by visitFunctionDef + visitCall. Keyed by function name (source-level).
+    struct FuncInfo {
+        SVF::FunObjVar* fun = nullptr;
+        SVF::FunEntryICFGNode* entry = nullptr;
+        SVF::FunExitICFGNode* exit  = nullptr;
+        SVF::NodeID funObjId = 0;
+        SVF::NodeID retVal   = 0;          // callee-owned return ValVar
+        std::vector<SVF::NodeID> formals;  // formal ValVars (one per param)
+        std::vector<std::string> formalNames;
+        std::vector<const SVF::SVFStructType*> formalStructTys; // null if not a struct
+        SVF::SVFBasicBlock* entryBB = nullptr;
+        SVF::SVFBasicBlock* exitBB  = nullptr;
+        SVF::SVFFunctionType* type = nullptr;
+        SVF::BasicBlockGraph* bbg = nullptr;
+        bool defined = false;
+        bool retIsPtr = false;
+    };
+    std::unordered_map<std::string, FuncInfo> funcInfos;
+
+    // Per-field metadata for structs, stored in declared order. For each
+    // field we track its source name and (if the field is itself a struct
+    // or a pointer-to-struct) the struct type it ultimately refers to —
+    // enough to resolve chained field accesses.
+    struct FieldMeta {
+        std::string name;
+        const SVF::SVFStructType* pointee = nullptr; // struct X (for X or X*)
+        bool isPointer = false;                      // field is a pointer
+    };
+    std::unordered_map<const SVF::SVFStructType*, std::vector<FieldMeta>> structFields;
+
+    // Unified "this NodeID represents a struct-X lvalue/pointer" map.
+    //   * Local/global/param symbols whose declared type is `struct X`
+    //     or `struct X*` get `sym.valId` tagged at creation.
+    //   * Loads of such symbols propagate the tag to the load dst.
+    //   * Field / subscript GEPs propagate based on FieldMeta.
+    //   * Casts propagate through the CopyStmt.
+    // Lookup in lvalueAddress/visitField/visitSubscript lets them emit
+    // constant-offset GepStmts for chained access (s.a.b, p->next->data,
+    // arr[i].field, etc.) instead of collapsing to variant GEPs.
+    std::unordered_map<SVF::NodeID, const SVF::SVFStructType*> nodeStructTy;
+
+    // Helper: tag nodeStructTy[id] = sty (no-op on nullptrs).
+    void tagStruct(SVF::NodeID id, const SVF::SVFStructType* sty) {
+        if (id && sty) nodeStructTy[id] = sty;
+    }
+    const SVF::SVFStructType* lookupNodeStruct(SVF::NodeID id) const {
+        auto it = nodeStructTy.find(id);
+        return it == nodeStructTy.end() ? nullptr : it->second;
+    }
+    // Find field metadata by source-level name.
+    int findFieldMetaIdx(const SVF::SVFStructType* sty,
+                         const std::string& fname) const;
 };
 
 } // namespace svfts

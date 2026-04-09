@@ -87,11 +87,12 @@ Symbol TSIRBuilder::createGlobal(const std::string& name, const SVFType* ty) {
     return s;
 }
 
-int TSIRBuilder::findFieldIdx(const SVFStructType* sty, const std::string& fname) const {
-    auto it = structFieldNames.find(sty);
-    if (it == structFieldNames.end()) return -1;
+int TSIRBuilder::findFieldMetaIdx(const SVFStructType* sty,
+                                  const std::string& fname) const {
+    auto it = structFields.find(sty);
+    if (it == structFields.end()) return -1;
     for (size_t i = 0; i < it->second.size(); ++i)
-        if (it->second[i] == fname) return (int)i;
+        if (it->second[i].name == fname) return (int)i;
     return -1;
 }
 
@@ -103,6 +104,14 @@ void TSIRBuilder::visitTranslationUnit(TSNode root, const std::string& src) {
     currentICFG = icfgB->global();
     st->enterScope();
     uint32_t n = ts_node_child_count(root);
+    // Pre-pass: register every function signature first so visitCall can
+    // resolve forward references (and so visitFunctionDef just fills bodies).
+    for (uint32_t i = 0; i < n; ++i) {
+        TSNode c = ts_node_child(root, i);
+        if (strcmp(ts_node_type(c), "function_definition") == 0)
+            prescanFunctionDef(c, src);
+    }
+    // Main pass.
     for (uint32_t i = 0; i < n; ++i) {
         TSNode c = ts_node_child(root, i);
         visitTopLevelDecl(c, src);
@@ -124,7 +133,7 @@ void TSIRBuilder::visitTopLevelDecl(TSNode n, const std::string& src) {
         if (ts_node_is_null(body)) return;
         std::string sname = ts_node_is_null(nameN) ? std::string("anon") : text(nameN, src);
         SVFStructType* sty = tb->getOrCreateStructType(sname);
-        std::vector<std::string>& fnames = structFieldNames[sty];
+        std::vector<FieldMeta>& fmetas = structFields[sty];
         std::vector<const SVFType*> fields;
         uint32_t bn = ts_node_child_count(body);
         for (uint32_t i = 0; i < bn; ++i) {
@@ -133,17 +142,22 @@ void TSIRBuilder::visitTopLevelDecl(TSNode n, const std::string& src) {
             TSNode tnode = ts_node_child_by_field_name(fd, "type", 4);
             TSNode dnode = ts_node_child_by_field_name(fd, "declarator", 10);
             SVFType* ft = tb->parseTypeFromNode(tnode, src);
-            // pointer-decorated declarator?
+            // Remember whether the *source* type is a struct (before we
+            // erase it to getPtrType for pointer-decorated declarators).
+            const SVFStructType* fieldStructTy = SVFUtil::dyn_cast<SVFStructType>(ft);
             std::string fname = ts_node_is_null(dnode) ? "" : text(dnode, src);
-            if (fname.find('*') != std::string::npos) ft = tb->getPtrType();
-            // strip pointer/array decorators from name
+            bool isPtr = (fname.find('*') != std::string::npos);
+            if (isPtr) ft = tb->getPtrType();
             while (!fname.empty() && (fname.front() == '*' || fname.front() == '&'))
                 fname.erase(fname.begin());
-            // strip [..]
             auto br = fname.find('[');
             if (br != std::string::npos) fname.erase(br);
             fields.push_back(ft);
-            fnames.push_back(fname);
+            FieldMeta fm;
+            fm.name      = fname;
+            fm.isPointer = isPtr;
+            fm.pointee   = fieldStructTy; // non-null for X or X*
+            fmetas.push_back(std::move(fm));
         }
         // Note: SVFStructType API only supports adding via friend; we
         // approximate by recreating with fields. Since the same name is
@@ -173,92 +187,97 @@ void TSIRBuilder::visitTopLevelDecl(TSNode n, const std::string& src) {
 
 // ---------------- function definition ----------------
 
-void TSIRBuilder::visitFunctionDef(TSNode n, const std::string& src) {
+namespace {
+// Dig the first identifier child under a subtree — used to extract a function
+// name from nested (pointer_)declarator wrappers.
+std::string digIdent(TSNode x, const std::string& src) {
+    if (ts_node_is_null(x)) return {};
+    if (strcmp(ts_node_type(x), "identifier") == 0)
+        return std::string(src.c_str() + ts_node_start_byte(x),
+                           ts_node_end_byte(x) - ts_node_start_byte(x));
+    for (uint32_t i = 0; i < ts_node_child_count(x); ++i) {
+        std::string r = digIdent(ts_node_child(x, i), src);
+        if (!r.empty()) return r;
+    }
+    return {};
+}
+TSNode findParamList(TSNode x) {
+    if (ts_node_is_null(x)) return TSNode{};
+    if (strcmp(ts_node_type(x), "parameter_list") == 0) return x;
+    for (uint32_t i = 0; i < ts_node_child_count(x); ++i) {
+        TSNode r = findParamList(ts_node_child(x, i));
+        if (!ts_node_is_null(r) && strcmp(ts_node_type(r), "parameter_list") == 0) return r;
+    }
+    return TSNode{};
+}
+} // namespace
+
+void TSIRBuilder::prescanFunctionDef(TSNode n, const std::string& src) {
     TSNode declN = ts_node_child_by_field_name(n, "declarator", 10);
     TSNode bodyN = ts_node_child_by_field_name(n, "body", 4);
     TSNode retTN = ts_node_child_by_field_name(n, "type", 4);
     if (ts_node_is_null(declN) || ts_node_is_null(bodyN)) return;
 
-    // function name lives inside declN as identifier child
-    std::string fname;
-    {
-        // walk to find an identifier
-        std::function<void(TSNode)> dig = [&](TSNode x) {
-            if (!fname.empty()) return;
-            if (strcmp(ts_node_type(x), "identifier") == 0) {
-                fname = text(x, src);
-                return;
-            }
-            for (uint32_t i = 0; i < ts_node_child_count(x); ++i) dig(ts_node_child(x, i));
-        };
-        dig(declN);
-    }
+    std::string fname = digIdent(declN, src);
     if (fname.empty()) return;
+    if (funcInfos.count(fname)) return;  // already registered
+
+    FuncInfo fi;
+    // A pointer return type manifests as a `pointer_declarator` wrapping
+    // the `function_declarator` at the top of declN.
+    fi.retIsPtr = (strcmp(ts_node_type(declN), "pointer_declarator") == 0);
 
     SVFType* retT = tb->parseTypeFromNode(retTN, src);
-    // build a function type with empty params (we don't introspect signature here)
     std::vector<const SVFType*> ptys;
-    auto* funTy = new SVFFunctionType(0, retT, ptys, false);
-    tb->buildStInfo(funTy);
+    fi.type = new SVFFunctionType(0, retT, ptys, false);
+    tb->buildStInfo(fi.type);
 
-    // FunObj + entry/exit ICFG nodes
-    NodeID funObjId = NodeIDAllocator::get()->allocateObjectId();
-    auto* info = new ObjTypeInfo(funTy, 1);
+    // FunObj
+    fi.funObjId = NodeIDAllocator::get()->allocateObjectId();
+    auto* info = new ObjTypeInfo(fi.type, 1);
     info->setFlag(ObjTypeInfo::FUNCTION_OBJ);
     info->setByteSizeOfObj(1);
-    B.addFunObjNode(funObjId, info, nullptr);
-    auto* funObj = const_cast<FunObjVar*>(SVFUtil::dyn_cast<FunObjVar>(pag->getGNode(funObjId)));
-    if (!funObj) return;
-    // Initialise BasicBlockGraph + LoopAndDomInfo so callers like
-    // FunEntryICFGNode that probe f->begin()/end() don't dereference null.
-    auto* bbg = new BasicBlockGraph();
-    auto* ld  = new SVFLoopAndDomInfo();
-    // local helper to add a properly-owned BB whose ->getFunction() works
-    auto makeBB = [&](const std::string& name) -> SVFBasicBlock* {
-        bbg->id++;
-        auto* bb = new SVFBasicBlock(bbg->id, funObj);
-        bb->setName(name);
-        bbg->addBasicBlock(bb);
+    B.addFunObjNode(fi.funObjId, info, nullptr);
+    fi.fun = const_cast<FunObjVar*>(SVFUtil::dyn_cast<FunObjVar>(pag->getGNode(fi.funObjId)));
+    if (!fi.fun) return;
+
+    // BasicBlockGraph / LoopAndDomInfo / dummy BBs so getFunction() works.
+    fi.bbg = new BasicBlockGraph();
+    auto* ld = new SVFLoopAndDomInfo();
+    auto makeBB = [&](const std::string& nm) -> SVFBasicBlock* {
+        fi.bbg->id++;
+        auto* bb = new SVFBasicBlock(fi.bbg->id, fi.fun);
+        bb->setName(nm);
+        fi.bbg->addBasicBlock(bb);
         return bb;
     };
-    auto* exitBB = makeBB("exit");
-    funObj->initFunObjVar(/*decl*/false, /*intrin*/false, /*addr*/false,
-                          /*uncalled*/false, /*notret*/false, /*vararg*/false,
-                          funTy, ld, /*real*/funObj, bbg, {}, exitBB);
-    currentFunc = funObj;
+    fi.exitBB  = makeBB("exit");
+    fi.fun->initFunObjVar(false, false, false, false, false, false,
+                          fi.type, ld, fi.fun, fi.bbg, {}, fi.exitBB);
+    fi.entryBB = makeBB("entry");
 
-    // create one dummy SVFBasicBlock attached to the function so ICFG nodes
-    // have something non-null to point at.
-    // Register the function in the CallGraph so Andersen can resolve it.
-    const_cast<CallGraph*>(pag->getCallGraph())->addCallGraphNode(funObj);
+    const_cast<CallGraph*>(pag->getCallGraph())->addCallGraphNode(fi.fun);
 
-    SVFBasicBlock* dummyBB = makeBB("entry");
-    currentBB = dummyBB;
-    auto* entry = icfgB->addFunEntry(funObj);
-    auto* exit  = icfgB->addFunExit(funObj);
-    currentICFG = entry;
+    fi.entry = icfgB->addFunEntry(fi.fun);
+    fi.exit  = icfgB->addFunExit(fi.fun);
 
-    // Register the function as a global symbol
-    Symbol fs;
-    fs.type = funTy;
-    fs.objId = funObjId;
-    fs.valId = freshValVar(SVFType::getSVFPtrType());
-    B.addAddrStmt(funObjId, fs.valId);
-    fs.isFunction = true;
-    st->addGlobal(fname, fs);
-
-    // Visit parameters
-    st->enterScope();
-    TSNode paramsN; // function_declarator → parameter_list
+    // Register function as a global symbol (takes its address).
     {
-        std::function<void(TSNode)> findP = [&](TSNode x) {
-            if (!ts_node_is_null(paramsN)) return;
-            if (strcmp(ts_node_type(x), "parameter_list") == 0) { paramsN = x; return; }
-            for (uint32_t i = 0; i < ts_node_child_count(x); ++i) findP(ts_node_child(x, i));
-        };
-        paramsN = TSNode{}; // null-init
-        findP(declN);
+        Symbol fs;
+        fs.type = fi.type;
+        fs.objId = fi.funObjId;
+        // We want the function-pointer ValVar anchored at the global ICFG node.
+        NodeID id = NodeIDAllocator::get()->allocateValueId();
+        B.addValNode(id, SVFType::getSVFPtrType(), icfgB->global());
+        fs.valId = id;
+        nameNode(id, fname);
+        B.addAddrStmt(fi.funObjId, fs.valId);
+        fs.isFunction = true;
+        st->addGlobal(fname, fs);
     }
+
+    // Create formal ValVars anchored at the function entry.
+    TSNode paramsN = findParamList(declN);
     if (!ts_node_is_null(paramsN)) {
         uint32_t pn = ts_node_named_child_count(paramsN);
         for (uint32_t i = 0; i < pn; ++i) {
@@ -267,25 +286,79 @@ void TSIRBuilder::visitFunctionDef(TSNode n, const std::string& src) {
             TSNode pT = ts_node_child_by_field_name(p, "type", 4);
             TSNode pD = ts_node_child_by_field_name(p, "declarator", 10);
             SVFType* pty = tb->parseTypeFromNode(pT, src);
-            std::string pname = ts_node_is_null(pD) ? std::string("arg") + std::to_string(i)
-                                                    : text(pD, src);
-            // strip pointer markers
-            bool isPtr = (pname.find('*') != std::string::npos);
+            const SVFStructType* pstruct = SVFUtil::dyn_cast<SVFStructType>(pty);
+            std::string pname = ts_node_is_null(pD)
+                                ? std::string("arg") + std::to_string(i)
+                                : text(pD, src);
             while (!pname.empty() && (pname.front() == '*' || pname.front() == ' '))
                 pname.erase(pname.begin());
-            if (isPtr) pty = tb->getPtrType();
-            createLocal(pname, pty);
+            auto br = pname.find('[');
+            if (br != std::string::npos) pname.erase(br);
+            NodeID fv = NodeIDAllocator::get()->allocateValueId();
+            B.addValNode(fv, SVFType::getSVFPtrType(), fi.entry);
+            nameNode(fv, pname);
+            fi.formals.push_back(fv);
+            fi.formalNames.push_back(pname);
+            fi.formalStructTys.push_back(pstruct);
         }
     }
 
-    // Body
-    icfgB->seq(entry, currentICFG = icfgB->addIntra(currentBB));
+    // Return ValVar (callee-owned) anchored at the function exit.
+    fi.retVal = NodeIDAllocator::get()->allocateValueId();
+    B.addValNode(fi.retVal, SVFType::getSVFPtrType(), fi.exit);
+    nameNode(fi.retVal, fname + ".ret");
+
+    funcInfos.emplace(fname, fi);
+}
+
+void TSIRBuilder::visitFunctionDef(TSNode n, const std::string& src) {
+    TSNode declN = ts_node_child_by_field_name(n, "declarator", 10);
+    TSNode bodyN = ts_node_child_by_field_name(n, "body", 4);
+    if (ts_node_is_null(declN) || ts_node_is_null(bodyN)) return;
+
+    std::string fname = digIdent(declN, src);
+    if (fname.empty()) return;
+    auto it = funcInfos.find(fname);
+    if (it == funcInfos.end()) return;
+    FuncInfo& fi = it->second;
+    if (fi.defined) return;
+    fi.defined = true;
+
+    currentFunc     = fi.fun;
+    currentBB       = fi.entryBB;
+    currentRetVal   = fi.retVal;
+    currentRetIsPtr = fi.retIsPtr;
+
+    // Body executes in an intra node chained from entry.
+    currentICFG = icfgB->addIntra(currentBB);
+    icfgB->seq(fi.entry, currentICFG);
+
+    // Bind each formal to a backing stack slot, then store the incoming
+    // formal value into the slot. This mirrors clang's alloca-based
+    // parameter ABI so reads of `p` inside the body go through a Load
+    // (preserving the p->{p, ...} self-object pattern Andersen sees from
+    // the LLVM frontend) while CallPE still targets the bare formal.
+    st->enterScope();
+    for (size_t i = 0; i < fi.formals.size(); ++i) {
+        Symbol s = createLocal(fi.formalNames[i], tb->getPtrType());
+        B.addStoreStmt(fi.formals[i], s.valId, currentICFG);
+        // If the parameter is declared as `struct X` or `struct X*`, the
+        // slot's identifier reads should resolve to a struct type for
+        // downstream field access.
+        if (i < fi.formalStructTys.size() && fi.formalStructTys[i]) {
+            tagStruct(s.valId,          fi.formalStructTys[i]);
+            tagStruct(fi.formals[i],    fi.formalStructTys[i]);
+        }
+    }
+
     visitStmt(bodyN, src);
-    icfgB->seq(currentICFG, exit);
+    icfgB->seq(currentICFG, fi.exit);
 
     st->exitScope();
-    currentFunc = nullptr;
-    currentICFG = nullptr;
+    currentFunc     = nullptr;
+    currentICFG     = nullptr;
+    currentRetVal   = 0;
+    currentRetIsPtr = false;
 }
 
 // ---------------- global declaration ----------------
@@ -293,6 +366,7 @@ void TSIRBuilder::visitFunctionDef(TSNode n, const std::string& src) {
 void TSIRBuilder::visitGlobalDecl(TSNode n, const std::string& src) {
     TSNode tnode = ts_node_child_by_field_name(n, "type", 4);
     SVFType* ty = tb->parseTypeFromNode(tnode, src);
+    const SVFStructType* declStructTy = SVFUtil::dyn_cast<SVFStructType>(ty);
     uint32_t cn = ts_node_child_count(n);
     for (uint32_t i = 0; i < cn; ++i) {
         TSNode c = ts_node_child(n, i);
@@ -313,6 +387,10 @@ void TSIRBuilder::visitGlobalDecl(TSNode n, const std::string& src) {
             if (strcmp(k, "pointer_declarator") == 0 || text(c, src).find('*') != std::string::npos)
                 eff = tb->getPtrType();
             Symbol s = createGlobal(name, eff);
+            if (declStructTy) tagStruct(s.valId, declStructTy);
+            if (strcmp(k, "array_declarator") == 0 ||
+                text(c, src).find('[') != std::string::npos)
+                if (auto* m = st->lookupMutable(name)) m->isArray = true;
             // Process initializer if present (init_declarator only)
             if (strcmp(k, "init_declarator") == 0) {
                 TSNode valN = ts_node_child_by_field_name(c, "value", 5);
@@ -355,6 +433,13 @@ void TSIRBuilder::visitCompound(TSNode n, const std::string& src) {
 void TSIRBuilder::visitLocalDecl(TSNode n, const std::string& src) {
     TSNode tnode = ts_node_child_by_field_name(n, "type", 4);
     SVFType* baseT = tb->parseTypeFromNode(tnode, src);
+    // If the declared *source* type is a struct (or pointer-to-struct),
+    // remember it so field accesses on this variable can resolve indices.
+    // Note: for `struct X *p` visitLocalDecl still sees `struct X` as the
+    // base type (the declarator contributes the `*`), so capturing baseT
+    // before the pointer-stripping below is correct.
+    const SVFStructType* declStructTy =
+        SVFUtil::dyn_cast<SVFStructType>(baseT);
     uint32_t cn = ts_node_child_count(n);
     for (uint32_t i = 0; i < cn; ++i) {
         TSNode c = ts_node_child(n, i);
@@ -372,7 +457,11 @@ void TSIRBuilder::visitLocalDecl(TSNode n, const std::string& src) {
             if (name.empty()) continue;
             SVFType* eff = baseT;
             if (text(declN, src).find('*') != std::string::npos) eff = tb->getPtrType();
+            bool declIsArray = text(declN, src).find('[') != std::string::npos;
             Symbol s = createLocal(name, eff);
+            if (declStructTy) tagStruct(s.valId, declStructTy);
+            if (declIsArray)
+                if (auto* m = st->lookupMutable(name)) m->isArray = true;
             if (!ts_node_is_null(valN)) {
                 NodeID rhs = visitExpr(valN, src);
                 B.addStoreStmt(rhs, s.valId, currentICFG);
@@ -390,7 +479,12 @@ void TSIRBuilder::visitLocalDecl(TSNode n, const std::string& src) {
             if (name.empty()) continue;
             SVFType* eff = baseT;
             if (strcmp(k, "pointer_declarator") == 0) eff = tb->getPtrType();
-            createLocal(name, eff);
+            bool bareIsArray = (strcmp(k, "array_declarator") == 0) ||
+                               (text(c, src).find('[') != std::string::npos);
+            Symbol s2 = createLocal(name, eff);
+            if (declStructTy) tagStruct(s2.valId, declStructTy);
+            if (bareIsArray)
+                if (auto* m = st->lookupMutable(name)) m->isArray = true;
         }
     }
 }
@@ -401,11 +495,14 @@ void TSIRBuilder::visitExprStmt(TSNode n, const std::string& src) {
 }
 
 void TSIRBuilder::visitReturn(TSNode n, const std::string& src) {
-    if (ts_node_named_child_count(n) > 0 && currentFunc) {
+    if (ts_node_named_child_count(n) > 0 && currentFunc && currentRetVal) {
         NodeID v = visitExpr(ts_node_named_child(n, 0), src);
-        // RetValPN is owned by the function; we leave wiring to a higher pass
-        // (omitted in first cut)
-        (void)v;
+        // Only wire the return flow for pointer-returning functions. For
+        // int-returning functions (the common `return 0;` case) there is
+        // no pointer value to propagate, and emitting a Copy would violate
+        // the verifier's pointer-typed invariant.
+        if (currentRetIsPtr && pag->hasGNode(v) && pag->getGNode(v)->isPointer())
+            B.addCopyStmt(v, currentRetVal);
     }
 }
 
@@ -470,9 +567,20 @@ NodeID TSIRBuilder::visitIdentifier(TSNode n, const std::string& src) {
         // unknown identifier — create dummy
         return freshValVar(nullptr);
     }
-    // For pointer-typed identifiers used as rvalues we conceptually load:
+    // Functions used by name yield their address ValVar directly.
+    if (sym->isFunction) return sym->valId;
+    // Arrays decay to their address — no load. The identifier's value is
+    // the pointer-to-first-element, which in our PAG model is the ValVar
+    // that already holds `&arr.obj`.
+    if (sym->isArray) return sym->valId;
+    // Otherwise it's a stack/global slot: the identifier's value is what
+    // the slot currently holds, i.e. a load through its address.
     NodeID dst = freshValVar(SVFType::getSVFPtrType());
     B.addLoadStmt(sym->valId, dst);
+    // Propagate struct tagging across the load so chained accesses like
+    // `p->next->data` (where `p` is `struct Node *`) continue to resolve
+    // constant field offsets.
+    tagStruct(dst, lookupNodeStruct(sym->valId));
     return dst;
 }
 
@@ -514,8 +622,39 @@ NodeID TSIRBuilder::visitUnary(TSNode n, const std::string& src) {
 NodeID TSIRBuilder::visitBinary(TSNode n, const std::string& src) {
     TSNode l = ts_node_child_by_field_name(n, "left", 4);
     TSNode r = ts_node_child_by_field_name(n, "right", 5);
-    if (!ts_node_is_null(l)) visitExpr(l, src);
-    if (!ts_node_is_null(r)) visitExpr(r, src);
+    TSNode opN = ts_node_child_by_field_name(n, "operator", 8);
+    NodeID lv = ts_node_is_null(l) ? 0 : visitExpr(l, src);
+    NodeID rv = ts_node_is_null(r) ? 0 : visitExpr(r, src);
+    std::string op = ts_node_is_null(opN) ? "" : text(opN, src);
+
+    // Pointer arithmetic: `p + n`, `p - n`, `n + p` collapse to `&p[0]`
+    // under SVF's array-insensitive model (Cat 4). We need to recognise a
+    // "C pointer" *source-level*, because in our PAG model every local
+    // ValVar is nominally pointer-typed (it holds an alloca address), so
+    // `isPointer()` is too eager and would fire on `i + 1`.
+    auto isCPointerExpr = [&](TSNode x) -> bool {
+        if (ts_node_is_null(x)) return false;
+        const char* k = ts_node_type(x);
+        if (strcmp(k, "identifier") == 0) {
+            const Symbol* sym = st->lookup(text(x, src));
+            return sym && sym->type == tb->getPtrType();
+        }
+        return strcmp(k, "field_expression")     == 0 ||
+               strcmp(k, "subscript_expression") == 0 ||
+               strcmp(k, "cast_expression")      == 0 ||
+               strcmp(k, "pointer_expression")   == 0;
+    };
+    if (op == "+" || op == "-") {
+        bool lp = isCPointerExpr(l);
+        bool rp = isCPointerExpr(r);
+        if (lp || rp) {
+            NodeID base = lp ? lv : rv;
+            NodeID g = gep->addConstFieldGep(base, 0, SVFType::getSVFPtrType(),
+                                             currentICFG);
+            tagStruct(g, lookupNodeStruct(base));
+            return g;
+        }
+    }
     return freshValVar(nullptr);
 }
 
@@ -539,56 +678,60 @@ NodeID TSIRBuilder::visitAssign(TSNode n, const std::string& src) {
         B.addStoreStmt(rhs, p, currentICFG);
         return rhs;
     }
-    if (strcmp(k, "field_expression") == 0) {
-        // s.field = rhs or p->field = rhs
-        TSNode obj = ts_node_child_by_field_name(l, "argument", 8);
-        TSNode fld = ts_node_child_by_field_name(l, "field", 5);
-        TSNode opN = ts_node_child_by_field_name(l, "operator", 8);
-        std::string op = ts_node_is_null(opN) ? "." : text(opN, src);
-        std::string fname = ts_node_is_null(fld) ? "" : text(fld, src);
-        NodeID baseId = 0;
-        const SVFStructType* sty = nullptr;
-        if (op == ".") {
-            // need address-of obj
-            baseId = lvalueAddress(obj, src);
-        } else {
-            baseId = visitExpr(obj, src);
-        }
-        // we don't track types precisely → variant gep
-        NodeID gepDst = gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
-        (void)sty; (void)fname;
-        B.addStoreStmt(rhs, gepDst, currentICFG);
-        return rhs;
-    }
-    if (strcmp(k, "subscript_expression") == 0) {
-        TSNode arr = ts_node_child_by_field_name(l, "argument", 8);
-        NodeID base = visitExpr(arr, src);
-        NodeID g = gep->addVariantGep(base, SVFType::getSVFPtrType(), currentICFG);
-        B.addStoreStmt(rhs, g, currentICFG);
+    if (strcmp(k, "field_expression") == 0 ||
+        strcmp(k, "subscript_expression") == 0) {
+        // `s.f = rhs`, `p->f = rhs`, `arr[i] = rhs`, `s.arr[i].f = rhs`
+        // all share the same shape: compute the lvalue address (possibly
+        // a chain of const-offset GEPs) and store through it.
+        NodeID dst = lvalueAddress(l, src);
+        B.addStoreStmt(rhs, dst, currentICFG);
         return rhs;
     }
     return rhs;
 }
 
 NodeID TSIRBuilder::visitField(TSNode n, const std::string& src) {
+    // Inline the lvalueAddress(field_expression) logic so we know the
+    // resolved FieldMeta at Load time (without re-visiting sub-trees).
     TSNode obj = ts_node_child_by_field_name(n, "argument", 8);
     TSNode opN = ts_node_child_by_field_name(n, "operator", 8);
-    std::string op = ts_node_is_null(opN) ? "." : text(opN, src);
-    NodeID baseId;
-    if (op == ".") baseId = lvalueAddress(obj, src);
-    else            baseId = visitExpr(obj, src);
-    NodeID g = gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
+    TSNode fld = ts_node_child_by_field_name(n, "field", 5);
+    std::string op    = ts_node_is_null(opN) ? "." : text(opN, src);
+    std::string fname = ts_node_is_null(fld) ? "" : text(fld, src);
+
+    NodeID baseId = (op == ".") ? lvalueAddress(obj, src)
+                                : visitExpr(obj, src);
+    const SVFStructType* sty = lookupNodeStruct(baseId);
+
+    NodeID g;
+    const FieldMeta* fm = nullptr;
+    if (sty) {
+        int idx = findFieldMetaIdx(sty, fname);
+        if (idx >= 0) {
+            fm = &structFields[sty][idx];
+            g = gep->addConstFieldGep(baseId, (unsigned)idx, sty, currentICFG);
+        } else {
+            g = gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
+        }
+    } else {
+        g = gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
+    }
+    if (fm && fm->pointee && !fm->isPointer) tagStruct(g, fm->pointee);
+
     NodeID dst = freshValVar(SVFType::getSVFPtrType());
     B.addLoadStmt(g, dst);
+    // Pointer-to-struct field: loaded value is a struct-X lvalue.
+    if (fm && fm->pointee && fm->isPointer) tagStruct(dst, fm->pointee);
     return dst;
 }
 
 NodeID TSIRBuilder::visitSubscript(TSNode n, const std::string& src) {
-    TSNode arr = ts_node_child_by_field_name(n, "argument", 8);
-    NodeID base = visitExpr(arr, src);
-    NodeID g = gep->addVariantGep(base, SVFType::getSVFPtrType(), currentICFG);
+    NodeID g = lvalueAddress(n, src);
     NodeID dst = freshValVar(SVFType::getSVFPtrType());
     B.addLoadStmt(g, dst);
+    // Array-of-struct element: propagate the struct tag across the load
+    // so that `arr[i].field` can GEP into it.
+    tagStruct(dst, lookupNodeStruct(g));
     return dst;
 }
 
@@ -603,42 +746,184 @@ NodeID TSIRBuilder::visitCall(TSNode n, const std::string& src) {
         B.addAddrStmt(heap, v);
         return v;
     }
-    // visit arguments to keep their side-effects
+
+    // Collect evaluated argument ValVars first (side-effects always happen).
+    std::vector<NodeID> argVals;
     if (!ts_node_is_null(args)) {
         uint32_t an = ts_node_named_child_count(args);
         for (uint32_t i = 0; i < an; ++i)
-            visitExpr(ts_node_named_child(args, i), src);
+            argVals.push_back(visitExpr(ts_node_named_child(args, i), src));
     }
-    return freshValVar(SVFType::getSVFPtrType());
+
+    // Direct call: look up by name in the pre-scanned function table.
+    auto it = funcInfos.find(fname);
+    if (it == funcInfos.end()) {
+        // Unknown / external / indirect — sound stub.
+        return freshValVar(SVFType::getSVFPtrType());
+    }
+    FuncInfo& fi = it->second;
+
+    // ICFG: insert a CallICFGNode + RetICFGNode chain between currentICFG
+    // and the callee's entry/exit nodes. Subsequent intra statements of the
+    // caller continue to extend from the existing currentICFG (the call/ret
+    // pair hangs off as an interprocedural side-branch).
+    CallICFGNode* callNode = icfgB->addCall(currentBB, fi.type, fi.fun, false);
+    RetICFGNode*  retNode  = icfgB->addRet(callNode);
+    if (currentICFG) icfgB->seq(currentICFG, callNode);
+    icfgB->callEdge(callNode, fi.entry);
+    icfgB->retEdge(fi.exit,  retNode);
+    // Also wire the direct CallGraph edge so Andersen sees the callee.
+    const_cast<CallGraph*>(pag->getCallGraph())
+        ->addDirectCallGraphEdge(callNode, currentFunc, fi.fun);
+
+    // CallPE for each actual→formal pair. Extra actuals are dropped (vararg
+    // is not yet supported); missing actuals leave formals unbound (sound).
+    size_t npairs = std::min(argVals.size(), fi.formals.size());
+    for (size_t i = 0; i < npairs; ++i) {
+        B.addCallPE(argVals[i], fi.formals[i], callNode, fi.entry);
+    }
+
+    // RetPE from callee return ValVar into a fresh caller-side result ValVar.
+    NodeID result = freshValVar(SVFType::getSVFPtrType());
+    B.addRetPE(fi.retVal, result, callNode, fi.exit);
+    return result;
 }
 
 NodeID TSIRBuilder::visitCast(TSNode n, const std::string& src) {
-    // cast = pointer copy in our model
-    if (ts_node_named_child_count(n) > 0)
-        return visitExpr(ts_node_named_child(n, ts_node_named_child_count(n) - 1), src);
-    return freshValVar(nullptr);
+    // A C cast is modelled as a pointer-to-pointer CopyStmt (Cat 5).
+    // tree-sitter-c emits `cast_expression` with a type field and a value
+    // field; the value is the last named child in practice.
+    if (ts_node_named_child_count(n) == 0) return freshValVar(nullptr);
+    TSNode valN = ts_node_child_by_field_name(n, "value", 5);
+    if (ts_node_is_null(valN))
+        valN = ts_node_named_child(n, ts_node_named_child_count(n) - 1);
+    NodeID inner = visitExpr(valN, src);
+
+    // If we're casting to a pointer type like `(struct X*)p`, propagate
+    // the target struct so subsequent `->field` accesses resolve.
+    const SVFStructType* castStruct = nullptr;
+    TSNode typeN = ts_node_child_by_field_name(n, "type", 4);
+    if (!ts_node_is_null(typeN)) {
+        SVFType* castTy = tb->parseTypeFromNode(typeN, src);
+        castStruct = SVFUtil::dyn_cast<SVFStructType>(castTy);
+    }
+
+    // Emit an actual CopyStmt so the cast survives as a dedicated edge.
+    // Only legal when the source is pointer-typed; otherwise pass-through.
+    if (pag->hasGNode(inner) && pag->getGNode(inner)->isPointer()) {
+        NodeID dst = freshValVar(SVFType::getSVFPtrType());
+        B.addCopyStmt(inner, dst);
+        if (castStruct) tagStruct(dst, castStruct);
+        else            tagStruct(dst, lookupNodeStruct(inner));
+        return dst;
+    }
+    return inner;
 }
 
+// -------- GEP core --------
+//
+// lvalueAddress returns a NodeID holding the ADDRESS of the given lvalue
+// expression (no final load). It is the canonical place where GepStmts are
+// emitted; visitField/visitSubscript are thin wrappers that add a Load on
+// top when the outer context wants an rvalue. The recursive structure lets
+// chained accesses (`s.a.b`, `p->next->data`, `arr[i].field`) propagate
+// the struct-type chain through `nodeStructTy` and produce a constant-
+// offset GepStmt at every link whenever the type is known.
 NodeID TSIRBuilder::lvalueAddress(TSNode n, const std::string& src) {
     if (ts_node_is_null(n)) return freshValVar(nullptr);
     const char* k = ts_node_type(n);
+
+    if (strcmp(k, "parenthesized_expression") == 0 &&
+        ts_node_named_child_count(n) > 0)
+        return lvalueAddress(ts_node_named_child(n, 0), src);
+
     if (strcmp(k, "identifier") == 0) {
         const Symbol* sym = st->lookup(text(n, src));
         if (!sym) return freshValVar(nullptr);
         return sym->valId; // already holds the address
     }
+
+    // `*p` as an lvalue: the address IS the pointer value p.
+    if (strcmp(k, "pointer_expression") == 0 ||
+        strcmp(k, "unary_expression") == 0) {
+        TSNode opN = ts_node_child_by_field_name(n, "operator", 8);
+        std::string op = ts_node_is_null(opN) ? "" : text(opN, src);
+        if (op == "*") {
+            TSNode arg = ts_node_child_by_field_name(n, "argument", 8);
+            if (ts_node_is_null(arg) && ts_node_named_child_count(n) > 0)
+                arg = ts_node_named_child(n, 0);
+            NodeID p = visitExpr(arg, src);
+            return p;
+        }
+    }
+
     if (strcmp(k, "field_expression") == 0) {
         TSNode obj = ts_node_child_by_field_name(n, "argument", 8);
         TSNode opN = ts_node_child_by_field_name(n, "operator", 8);
-        std::string op = ts_node_is_null(opN) ? "." : text(opN, src);
-        NodeID baseId = (op == ".") ? lvalueAddress(obj, src) : visitExpr(obj, src);
-        return gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
+        TSNode fld = ts_node_child_by_field_name(n, "field", 5);
+        std::string op    = ts_node_is_null(opN) ? "." : text(opN, src);
+        std::string fname = ts_node_is_null(fld) ? "" : text(fld, src);
+
+        // For `.` the base is the address of the containing struct (an
+        // lvalue); for `->` the base is the pointer value that points to
+        // the containing struct (an rvalue).
+        NodeID baseId = (op == ".") ? lvalueAddress(obj, src)
+                                    : visitExpr(obj, src);
+        const SVFStructType* sty = lookupNodeStruct(baseId);
+
+        NodeID g;
+        const FieldMeta* fm = nullptr;
+        if (sty) {
+            int idx = findFieldMetaIdx(sty, fname);
+            if (idx >= 0) {
+                fm = &structFields[sty][idx];
+                g = gep->addConstFieldGep(baseId, (unsigned)idx, sty, currentICFG);
+            } else {
+                g = gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
+            }
+        } else {
+            g = gep->addVariantGep(baseId, SVFType::getSVFPtrType(), currentICFG);
+        }
+
+        // Propagate struct type through the GEP result for chaining.
+        //   - Direct nested struct field (`struct Inner inner;`): g is the
+        //     address of the embedded sub-object, which IS a struct Inner
+        //     lvalue — tag it.
+        //   - Pointer-to-struct field (`struct Inner *p;`): g is the
+        //     address of the slot holding the pointer; dereferencing it
+        //     yields a struct Inner lvalue, so tagging happens in the
+        //     enclosing visitField's load destination, not here.
+        if (fm && fm->pointee && !fm->isPointer)
+            tagStruct(g, fm->pointee);
+        return g;
     }
+
     if (strcmp(k, "subscript_expression") == 0) {
         TSNode arr = ts_node_child_by_field_name(n, "argument", 8);
-        NodeID b = visitExpr(arr, src);
-        return gep->addVariantGep(b, SVFType::getSVFPtrType(), currentICFG);
+        TSNode idx = ts_node_child_by_field_name(n, "index", 5);
+        // The base of an array access is itself an lvalue: `s.arr[i]`
+        // wants the address of `s.arr`, not a load of it. When the base
+        // is an identifier though, decay semantics dictate using the
+        // loaded pointer (so `int *p; p[i]` works).
+        NodeID baseId;
+        const char* bk = ts_node_type(arr);
+        if (strcmp(bk, "identifier") == 0)
+            baseId = visitExpr(arr, src); // array decay
+        else
+            baseId = lvalueAddress(arr, src);
+        if (!ts_node_is_null(idx)) visitExpr(idx, src); // side-effects
+        // SVF is array-insensitive: every element collapses to field 0.
+        const SVFStructType* baseSty = lookupNodeStruct(baseId);
+        NodeID g = gep->addConstFieldGep(baseId, 0, SVFType::getSVFPtrType(),
+                                         currentICFG);
+        // arrays-of-structs preserve the element struct type.
+        if (baseSty) tagStruct(g, baseSty);
+        return g;
     }
+
+    // Anything else: evaluate as rvalue and use the resulting node as
+    // the "address" — this is wrong for non-pointer scalars but lets the
+    // visitor degrade gracefully.
     return visitExpr(n, src);
 }
 

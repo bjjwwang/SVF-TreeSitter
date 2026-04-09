@@ -2,6 +2,8 @@
 #include "svf-ts/TSFrontend.h"
 #include "svf-ts/SVFIRVerifier.h"
 #include "SVFIR/SVFIR.h"
+#include "SVFIR/SVFVariables.h"
+#include "Util/SVFUtil.h"
 #include "WPA/Andersen.h"
 #include <iostream>
 #include <string>
@@ -48,19 +50,32 @@ int main(int argc, char** argv) {
             // Iterate ALL nodes (top-level ValVars *and* ObjVars), so both
             // p->{p.addr} (top-level) and p.addr->{a.addr} (memory contents)
             // are visible. The extractor normalizes ".addr" away.
+            // GepObjVars are created implicitly by Andersen and come back
+            // nameless from the SVFIR; synthesise a name from the base
+            // object so the L3 normaliser (which keys points-to sets by
+            // variable name) can see our field-level pts and match the
+            // LLVM frontend's output.
+            auto nameOf = [&](SVFVar* v) -> std::string {
+                if (!v) return {};
+                if (auto* g = SVFUtil::dyn_cast<GepObjVar>(v)) {
+                    if (auto* b = g->getBaseObj())
+                        return b->getName();
+                }
+                return v->getName();
+            };
             for (auto it = pag->begin(); it != pag->end(); ++it) {
                 NodeID id = it->first;
                 SVFVar* var = it->second;
                 if (!var) continue;
                 const PointsTo& pts = a->getPts(id);
                 if (pts.empty()) continue;
-                std::cout << "PTS " << var->getName() << " #" << id << " -> {";
+                std::cout << "PTS " << nameOf(var) << " #" << id << " -> {";
                 bool first = true;
                 for (NodeID t : pts) {
                     if (!pag->hasGNode(t)) continue;
                     SVFVar* tv = pag->getGNode(t);
                     if (!first) std::cout << " ";
-                    std::cout << tv->getName() << "#" << t;
+                    std::cout << nameOf(tv) << "#" << t;
                     first = false;
                 }
                 std::cout << " }\n";
